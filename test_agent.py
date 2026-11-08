@@ -195,3 +195,42 @@ def test_reads_port_from_environment():
 # ---------------------------------------------------------------------------
 # Add your own tests below, e.g. "with two aces preflop my bot raises".
 # ---------------------------------------------------------------------------
+
+def test_fast_evaluator_matches_reference():
+    import numpy as np
+
+    import pokerlib
+    from evaluator import omaha_score
+    rng = np.random.default_rng(1)
+    for _ in range(2000):
+        cards = rng.permutation(36)[:10]
+        fast = int(pokerlib.best_scores(pokerlib.pair_keys(cards[:5]), pokerlib.triple_keys(cards[5:])))
+        assert fast == omaha_score(list(cards[:5]), list(cards[5:]))
+
+
+def _river_obs(hole, board, to_call=0):
+    from evaluator import cards_from_str
+    from game import ObservedAction, Observation, Street
+    history = (ObservedAction(Street.RIVER, False, Action.RAISE_POT, to_call, to_call),) if to_call else ()
+    legal = (Action.FOLD,) * (to_call > 0) + (Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT)
+    pot = 20 + to_call
+    return Observation(
+        hand_index=0, street=Street.RIVER, hole_cards=tuple(sorted(cards_from_str(hole))),
+        board=tuple(cards_from_str(board)), pot=pot, to_call=to_call, my_bet=0, opp_bet=to_call,
+        my_stack=70, opp_stack=70 - to_call, is_button=False, legal_actions=legal,
+        raise_to={Action.RAISE_HALF: to_call + (pot + to_call) // 2, Action.RAISE_POT: to_call + pot + to_call},
+        min_raise_to=max(2, 2 * to_call), raises_this_street=int(to_call > 0), action_history=history, big_blind=2)
+
+
+def test_bets_the_nuts_on_the_river():
+    module = load_agent()
+    module.new_half(AgentConfig(), module.MEMORY)
+    obs = _river_obs("Ah Kh 6c 7d 8s", "Qh Jh Th 9c 6d")  # royal flush
+    assert module.choose_action(obs, module.MEMORY) in (Action.RAISE_HALF, Action.RAISE_POT)
+
+
+def test_folds_air_to_a_big_river_bet():
+    module = load_agent()
+    module.new_half(AgentConfig(), module.MEMORY)
+    obs = _river_obs("6c 7d 8s 6h 7s", "Ah Kh Qd Jc 9s", to_call=20)
+    assert module.choose_action(obs, module.MEMORY) == Action.FOLD

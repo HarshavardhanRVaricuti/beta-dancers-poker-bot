@@ -39,11 +39,50 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "TotallyAwesomeDatathonParticipant"   # TODO: your team name
+AGENT_NAME = "RangeEV"
 
 
 # ===== YOUR CODE HERE =====
+
+import time
+
+import numpy as np
+
+import pokerlib
+
+RAISES = (Action.RAISE_HALF, Action.RAISE_POT)
+
+# Priors for the opponent model, as (rate, pseudo-count). Index 0 = preflop, 1 = postflop.
+PRIOR_FOLD_TO_RAISE = ((0.30, 8.0), (0.40, 8.0))
+PRIOR_RAISE_RATE = ((0.30, 8.0), (0.30, 8.0))
+# Share of the opponent's shown-down raises made with a below-median hand.
+PRIOR_WEAK_RAISE = ((0.10, 6.0), (0.10, 6.0))
+SHOWDOWN_SAMPLES = 150
+RANGE_DECAY = 0.6   # how much earlier streets' actions still narrow the range
+
+# Monte Carlo sample counts. Big pots get more samples; everything is cut back
+# as the (estimated) time bank charge grows.
+SAMPLES_FULL = 400
+SAMPLES_BIG_POT = 900
+BIG_POT = 16
+# The judge charges each request's time beyond 1 ms. We only see our own
+# compute time, so assume the rest of the request costs this much more
+# (a slow tournament machine) when estimating the charge.
+OVERHEAD_FACTOR = 1.8
+GRACE = 0.001
+TIME_SOFT = 3.0      # estimated seconds charged before sampling less
+TIME_HARD = 5.0      # ... before sampling much less
+
+
+def _warm_numpy() -> None:
+    rng = np.random.default_rng(0)
+    for board in ((), (0, 5, 10), (0, 5, 10, 15), (0, 5, 10, 15, 20)):
+        pokerlib.simulate(rng, (30, 31, 25, 22, 17), board, SAMPLES_FULL)
+
+
+_warm_numpy()
+
 
 def new_half(config: AgentConfig, memory: dict) -> None:
     """Called at the start of each half-match (1000 hands).
@@ -56,6 +95,154 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     so nothing you learn in one half carries over to the other half.
     """
     memory["hands_played"] = 0
+    memory["rng"] = np.random.default_rng(int(time.time_ns() % (2 ** 32)))
+    memory["time_used"] = 0.0
+    # [phase] -> [faced our raise, folded to it]
+    memory["fold_stats"] = [[0, 0], [0, 0]]
+    # [phase] -> [opponent actions, of which raises]
+    memory["raise_stats"] = [[0, 0], [0, 0]]
+    # [phase] -> [opponent raises seen at showdown, of which made with a below-median hand]
+    memory["bluff_stats"] = [[0, 0], [0, 0]]
+    memory["opp_raise_streets"] = []  # streets of the opponent's raises this hand
+    memory["cur_hand"] = -1       # hand index of the last observation
+    memory["hist_seen"] = 0       # action_history entries already counted
+    memory["prev_entry"] = None   # (street, is_me, action) of the last counted entry
+    memory["my_last"] = None      # (street, action) we returned last
+    memory["sim_key"] = None
+    memory["sim"] = None
+
+
+def _phase(street) -> int:
+    return 0 if street == Street.PREFLOP else 1
+
+
+def _rate(stats: list, prior: tuple) -> float:
+    base, weight = prior
+    return (stats[1] + base * weight) / (stats[0] + weight)
+
+
+def _count_opp_action(memory: dict, street, action, prev) -> None:
+    ph = _phase(street)
+    rs = memory["raise_stats"][ph]
+    rs[0] += 1
+    rs[1] += action in RAISES
+    if prev is not None and prev[1] and prev[2] in RAISES and prev[0] == street:
+        fs = memory["fold_stats"][ph]
+        fs[0] += 1
+        fs[1] += action == Action.FOLD
+
+
+def _update_from_history(obs: Observation, memory: dict) -> None:
+    if obs.hand_index != memory["cur_hand"]:
+        memory["cur_hand"] = obs.hand_index
+        memory["hist_seen"] = 0
+        memory["prev_entry"] = None
+        memory["opp_raise_streets"] = []
+    hist = obs.action_history
+    for entry in hist[memory["hist_seen"]:]:
+        if not entry.is_me:
+            _count_opp_action(memory, entry.street, entry.action, memory["prev_entry"])
+            if entry.action in RAISES:
+                memory["opp_raise_streets"].append(entry.street)
+        memory["prev_entry"] = (entry.street, entry.is_me, entry.action)
+    memory["hist_seen"] = len(hist)
+
+
+def _bluff_share(memory: dict, ph: int) -> float:
+    """Estimated share of the opponent's raises made with below-median hands
+    beyond what honest raising would show (random hands are below median half the time)."""
+    return min(0.9, 2.0 * _rate(memory["bluff_stats"][ph], PRIOR_WEAK_RAISE[ph]))
+
+
+def _range_weights(obs: Observation, memory: dict, pct: np.ndarray) -> np.ndarray:
+    """Relative likelihood of each sampled opponent hand given their actions this hand.
+
+    pct is each sample's strength percentile among random hands on the current
+    street. A raise is modelled as: always with the top t of hands, and as a
+    bluff with a fraction q of the rest, where t and q reproduce the observed
+    raise rate and bluff share. Calling our raise keeps the top (1 - fold rate).
+    """
+    per_street: dict = {}
+    prev = None
+    for entry in obs.action_history:
+        if not entry.is_me:
+            s = per_street.setdefault(entry.street, [1.0, 1.0, False])
+            ph = _phase(entry.street)
+            if entry.action in RAISES:
+                r = min(0.95, max(0.08, _rate(memory["raise_stats"][ph], PRIOR_RAISE_RATE[ph])))
+                b = _bluff_share(memory, ph)
+                t = r * (1.0 - b)
+                q = r * b / (1.0 - t)
+                s[0] *= t
+                s[1] *= q
+            elif prev is not None and prev.is_me and prev.action in RAISES and prev.street == entry.street:
+                f = min(0.75, max(0.0, _rate(memory["fold_stats"][ph], PRIOR_FOLD_TO_RAISE[ph])))
+                s[0] *= 1.0 - f
+                s[2] = True
+        prev = entry
+    w = np.ones(pct.size)
+    for street, (top, q, called) in per_street.items():
+        if top >= 0.999:
+            continue
+        floor = max(q, 0.12 if called else 0.0, 0.01)
+        decay = 1.0 if street == obs.street else RANGE_DECAY
+        w *= np.where(pct >= 1.0 - top, 1.0, floor) ** decay
+    return w
+
+
+def _calling_part(strength: np.ndarray, w: np.ndarray, keep: float) -> np.ndarray:
+    """Weights restricted to the strongest `keep` share of the weighted range."""
+    if keep >= 0.999:
+        return w
+    order = np.argsort(-strength)
+    cum = np.cumsum(w[order])
+    inside = np.zeros(w.size, dtype=bool)
+    inside[order] = (cum - w[order]) < keep * cum[-1]
+    return np.where(inside, w, 0.0)
+
+
+def _get_sim(obs: Observation, memory: dict) -> dict:
+    key = (obs.hand_index, int(obs.street))
+    used = memory["time_used"]
+    if used < TIME_SOFT:
+        n = SAMPLES_BIG_POT if obs.pot + obs.to_call >= BIG_POT else SAMPLES_FULL
+    else:
+        n = 200 if used < TIME_HARD else 80
+    cached = memory["sim"]
+    if memory["sim_key"] == key and cached is not None and cached["result"].size >= n:
+        return cached
+    sim = pokerlib.simulate(memory["rng"], obs.hole_cards, obs.board, n)
+    sim["pct"] = np.argsort(np.argsort(sim["opp_str"])) / float(n)
+    memory["sim_key"] = key
+    memory["sim"] = sim
+    return sim
+
+
+def _decide(obs: Observation, memory: dict) -> Action:
+    legal = obs.legal_actions
+    sim = _get_sim(obs, memory)
+    result, strength, pct = sim["result"], sim["opp_str"], sim["pct"]
+    w = _range_weights(obs, memory, pct)
+    eq = float((result * w).sum() / w.sum())
+
+    pot, to_call = obs.pot, obs.to_call
+    evs = {Action.CHECK_CALL: eq * (pot + to_call) - to_call}
+    if Action.FOLD in legal:
+        evs[Action.FOLD] = 0.0
+
+    ph = _phase(obs.street)
+    f = _rate(memory["fold_stats"][ph], PRIOR_FOLD_TO_RAISE[ph])
+    wc = _calling_part(strength, w, 1.0 - f)
+    eq_c = float((result * wc).sum() / wc.sum())
+    for a in RAISES:
+        if a not in legal:
+            continue
+        rt = obs.raise_to[a]
+        mine = rt - obs.my_bet
+        theirs = rt - obs.opp_bet
+        evs[a] = f * pot + (1.0 - f) * (eq_c * (pot + mine + theirs) - mine)
+
+    return max(evs, key=evs.get)
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
@@ -78,19 +265,37 @@ def choose_action(obs: Observation, memory: dict) -> Action:
         action_history      this hand's actions so far; each has
                             street, is_me, action, amount, street_total
         big_blind           size of the big blind in chips
-
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
     """
+    start = time.perf_counter()
+    action = Action.CHECK_CALL
+    try:
+        _update_from_history(obs, memory)
+        action = _decide(obs, memory)
+    except Exception:
+        traceback.print_exc()
+    if action not in obs.legal_actions:
+        action = Action.CHECK_CALL
+    memory["my_last"] = (obs.street, action)
+    spent = (time.perf_counter() - start) * OVERHEAD_FACTOR
+    memory["time_used"] = memory.get("time_used", 0.0) + max(0.0, spent - GRACE)
+    return action
 
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
-        return Action.CHECK_CALL
-    return Action.FOLD
+
+BOARD_VISIBLE = {Street.PREFLOP: 0, Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}
+
+
+def _learn_from_showdown(result: HandResult, memory: dict) -> None:
+    """For each raise the opponent made this hand, check whether the hand
+    they showed was below median (equity < 50% vs a random hand) at the time."""
+    if memory["time_used"] > TIME_SOFT:
+        return
+    for street in set(memory["opp_raise_streets"]):
+        board = tuple(result.board[:BOARD_VISIBLE[street]])
+        dead_hole = tuple(result.opp_hole)
+        eq = float(pokerlib.simulate(memory["rng"], dead_hole, board, SHOWDOWN_SAMPLES)["result"].mean())
+        bs = memory["bluff_stats"][_phase(street)]
+        bs[0] += 1
+        bs[1] += eq < 0.5
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
@@ -105,6 +310,31 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
     only after a showdown, else None), winner ('me', 'opp' or 'split').
     """
     memory["hands_played"] += 1
+    start = time.perf_counter()
+    try:
+        _hand_end(result, memory)
+    except Exception:
+        traceback.print_exc()
+    memory["time_used"] += (time.perf_counter() - start) * OVERHEAD_FACTOR
+
+
+def _hand_end(result: HandResult, memory: dict) -> None:
+    if result.hand_index != memory["cur_hand"]:
+        # We never got to act, so the opponent folded on the button.
+        if not result.went_to_showdown:
+            memory["raise_stats"][0][0] += 1
+        return
+    if result.opp_hole is not None and len(result.board) == 5:
+        _learn_from_showdown(result, memory)
+    last = memory["my_last"]
+    if last is None or last[1] == Action.FOLD:
+        return
+    street, action = last
+    # The only action after our last decision is the opponent's closing one.
+    if action in RAISES:
+        folded = not result.went_to_showdown and result.winner == "me"
+        _count_opp_action(memory, street, Action.FOLD if folded else Action.CHECK_CALL,
+                          (street, True, action))
 
 # ===== END OF YOUR CODE =====
 
